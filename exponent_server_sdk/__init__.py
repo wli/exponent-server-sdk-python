@@ -133,7 +133,7 @@ PushMessage.__new__.__defaults__ = (None,) * len(PushMessage._fields)
 
 
 class PushResponse(namedtuple('PushResponse', [
-        'push_message', 'status', 'message', 'details'])):
+        'push_message', 'status', 'message', 'details', 'receipt_id'])):
     """Wrapper class for a push notification response.
 
     A successful single push notification:
@@ -292,7 +292,8 @@ class PushClient(object):
                 # If there is no status, assume error.
                 status=receipt.get('status', PushResponse.ERROR_STATUS),
                 message=receipt.get('message', ''),
-                details=receipt.get('details', None)))
+                details=receipt.get('details', None),
+                receipt_id=receipt.get('id', None)))
 
         return receipts
 
@@ -317,3 +318,91 @@ class PushClient(object):
            An array of PushResponse objects which contains the results.
         """
         return self._publish_internal(push_messages)
+
+    def get_push_receipt(self, receipt_id):
+        """Gets the status of a push notification
+
+        Args:
+            receipt_id: A push notification receipt ID.
+
+        Returns:
+            A PushResponse object which contains the results.
+        """
+        return self.get_push_receipts([receipt_id])[0]
+
+    def get_push_receipts(self, receipt_ids):
+        """Gets the status of multiple push notifications
+
+        Args:
+            push_messages: An array of push notification receipt IDs.
+
+        Returns:
+           An array of PushResponse objects which contains the results.
+        """
+        # Delayed import because this file is immediately read on install, and
+        # the requests library may not be installed yet.
+        import requests
+
+        response = requests.post(
+            self.host + self.api_url + '/push/getReceipts',
+            data=json.dumps({'ids': receipt_ids}),
+            headers={
+                'accept': 'application/json',
+                'accept-encoding': 'gzip, deflate',
+                'content-type': 'application/json',
+            }
+        )
+
+        # Let's validate the response format first.
+        try:
+            response_data = response.json()
+        except ValueError:
+            # The response isn't json. First, let's attempt to raise a normal
+            # http error. If it's a 200, then we'll raise our own error.
+            response.raise_for_status()
+
+            raise PushServerError('Invalid server response', response)
+
+        # If there are errors with the entire request, raise an error now.
+        if 'errors' in response_data:
+            raise PushServerError(
+                'Request failed',
+                response,
+                response_data=response_data,
+                errors=response_data['errors'])
+
+        # We expect the response to have a 'data' field with the responses.
+        if 'data' not in response_data:
+            raise PushServerError(
+                'Invalid server response',
+                response,
+                response_data=response_data)
+
+        # Use the requests library's built-in exceptions for any remaining 4xx
+        # and 5xx errors.
+        response.raise_for_status()
+
+        # Sanity check the response
+        if len(receipt_ids) != len(response_data['data']):
+            raise PushServerError(
+                ('Mismatched response length. Expected %d %s but only '
+                 'received %d' % (
+                     len(receipt_ids),
+                     'receipt' if len(receipt_ids) == 1 else 'receipts',
+                     len(response_data['data']))),
+                response,
+                response_data=response_data)
+
+        # At this point, we know it's a 200 and the response format is correct.
+        # Now let's parse the responses per push notification.
+        receipts = []
+        for receipt_id in receipt_ids:
+            receipt = response_data['data'][receipt_id]
+            receipts.append(PushResponse(
+                # If there is no status, assume error.
+                status=receipt.get('status', PushResponse.ERROR_STATUS),
+                message=receipt.get('message', ''),
+                details=receipt.get('details', None),
+                receipt_id=receipt_id))
+
+        return receipts
